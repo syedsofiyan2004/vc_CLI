@@ -3,39 +3,18 @@ name: Build & Deploy Docker Images → ECR → ECS
 
 on:
   push:
-    branches: 
-      - main
+    branches: [ main ]
 
 env:
-  AWS_REGION:       ap-south-1
-  AWS_ACCOUNT_ID:   030230817033
-  CLUSTER:          sofiyan-cluster
-  API_SERVICE:      api-service
-  PROXY_SERVICE:    proxy-service
+  AWS_REGION:     ap-south-1
+  AWS_ACCOUNT_ID: 030230817033
+  CLUSTER:        sofiyan-cluster
+  API_SERVICE:    api-service
+  PROXY_SERVICE:  proxy-service
 
 jobs:
-  ecr-login:
-    name: Authenticate to ECR
-    runs-on: ubuntu-latest
-    outputs:
-      login-password: ${{ steps.get-login-password.outputs.password }}
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}    # ← optional if you have temporary creds
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Get ECR login password
-        id: get-login-password
-        run: |
-          echo "password=$(aws ecr get-login-password --region $AWS_REGION)" >> $GITHUB_OUTPUT
-
   build-and-push:
-    name: Build & Push Docker Images
-    needs: ecr-login
+    name: Build & Push Images to ECR
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -50,50 +29,57 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Login to Amazon ECR
-        run: |
-          echo "${{ needs.ecr-login.outputs.login-password }}" \
-            | docker login \
-                --username AWS \
-                --password-stdin \
-                ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}    # omit if you don’t use temporary creds
+          aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Ensure ECR repository exists
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin \
+                $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Ensure ECR repo exists
         run: |
           aws ecr describe-repositories --repository-names "${{ matrix.service.name }}" \
             || aws ecr create-repository --repository-name "${{ matrix.service.name }}"
 
-      - name: Build & push ${{ matrix.service.name }} image
+      - name: Build & push ${{ matrix.service.name }}
         uses: docker/build-push-action@v4
         with:
           context: ${{ matrix.service.path }}
           file:    ${{ matrix.service.path }}/Dockerfile
           push:    true
-          tags:    ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.service.name }}:latest
+          tags:    |
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/${{ matrix.service.name }}:latest
 
-  update-ecs-services:
-    name: Trigger ECS rolling updates
+  update-ecs:
+    name: Roll ECS services to new images
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials (again)
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
       - name: Force new deployment for API service
         run: |
           aws ecs update-service \
-            --cluster ${{ env.CLUSTER }} \
-            --service ${{ env.API_SERVICE }} \
+            --cluster $CLUSTER \
+            --service $API_SERVICE \
             --force-new-deployment
 
       - name: Force new deployment for Proxy service
         run: |
           aws ecs update-service \
-            --cluster ${{ env.CLUSTER }} \
-            --service ${{ env.PROXY_SERVICE }} \
+            --cluster $CLUSTER \
+            --service $PROXY_SERVICE \
             --force-new-deployment
