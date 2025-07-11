@@ -1,4 +1,3 @@
-# .github/workflows/ci-cd.yml
 name: Build & Deploy Docker Images → ECR → ECS
 
 on:
@@ -7,7 +6,7 @@ on:
 
 env:
   AWS_REGION:     ap-south-1
-  AWS_ACCOUNT_ID: 030230817033
+  AWS_ACCOUNT_ID: "030230817033"       # ← quoted so YAML doesn’t strip the leading zero
   CLUSTER:        sofiyan-cluster
   API_SERVICE:    api-service
   PROXY_SERVICE:  proxy-service
@@ -16,15 +15,17 @@ jobs:
   build-and-push:
     name: Build & Push Images to ECR
     runs-on: ubuntu-latest
+
     strategy:
       matrix:
-        service:
-          - name: container-server
+        include:
+          - service: container-server
             path: Container-server
-          - name: api-server
+          - service: api-server
             path: Api-server
-          - name: s3-reverse-proxy
+          - service: s3-reverse-proxy
             path: S3-reverse-proxy
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -34,35 +35,36 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}    # omit if you don’t use temporary creds
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  # omit if not using temporary creds
           aws-region:            ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
         run: |
           aws ecr get-login-password --region $AWS_REGION \
             | docker login --username AWS --password-stdin \
-                $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
 
       - name: Ensure ECR repo exists
         run: |
-          aws ecr describe-repositories --repository-names "${{ matrix.service.name }}" \
-            || aws ecr create-repository --repository-name "${{ matrix.service.name }}"
+          aws ecr describe-repositories \
+            --repository-names "${{ matrix.service }}" \
+          || aws ecr create-repository \
+            --repository-name "${{ matrix.service }}"
 
-      - name: Build & push ${{ matrix.service.name }}
+      - name: Build & push ${{ matrix.service }}
         uses: docker/build-push-action@v4
         with:
-          context: ${{ matrix.service.path }}
-          file:    ${{ matrix.service.path }}/Dockerfile
+          context: ${{ matrix.path }}
+          file:    ${{ matrix.path }}/Dockerfile
           push:    true
-          tags:    |
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/${{ matrix.service.name }}:latest
+          tags:    ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.service }}:latest
 
   update-ecs:
     name: Roll ECS services to new images
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS credentials (again)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -73,13 +75,13 @@ jobs:
       - name: Force new deployment for API service
         run: |
           aws ecs update-service \
-            --cluster $CLUSTER \
-            --service $API_SERVICE \
+            --cluster ${{ env.CLUSTER }} \
+            --service ${{ env.API_SERVICE }} \
             --force-new-deployment
 
       - name: Force new deployment for Proxy service
         run: |
           aws ecs update-service \
-            --cluster $CLUSTER \
-            --service $PROXY_SERVICE \
+            --cluster ${{ env.CLUSTER }} \
+            --service ${{ env.PROXY_SERVICE }} \
             --force-new-deployment
