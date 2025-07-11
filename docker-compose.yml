@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: vc-redis
+    ports: ['6379:6379']
+
+  api-server:
+    build: ./Api-server
+    env_file: .env
+    ports:
+      - '${API_PORT:-9000}:9000'
+      - '${WS_PORT:-9002}:9002'
+    depends_on:
+      - redis
+
+  s3-proxy:
+    build: ./S3-reverse-proxy
+    env_file: .env
+    ports:
+      - '${PROXY_PORT:-8000}:8000'
+    depends_on:
+      - api-server
+
+  builder:
+    build: ./Container-server
+    env_file: .env
+    command: ["./main.sh"]
+    depends_on:
+      - redis
+      - api-server

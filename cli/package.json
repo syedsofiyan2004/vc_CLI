@@ -1,0 +1,11 @@
+{
+  "name": "vercel-clone-cli",
+  "version": "1.0.0",
+  "bin": { "vc": "./src/index.js" },
+  "dependencies": {
+    "commander": "^10.0.0",
+    "node-fetch": "^3.4.0",
+    "ws": "^8.13.0",
+    "inquirer": "^9.2.0"
+  }
+}
