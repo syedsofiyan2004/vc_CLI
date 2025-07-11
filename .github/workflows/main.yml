@@ -5,11 +5,13 @@ on:
     branches: [ main ]
 
 env:
-  AWS_REGION:     ap-south-1
-  AWS_ACCOUNT_ID: "030230817033"       # ← quoted so YAML doesn’t strip the leading zero
-  CLUSTER:        sofiyan-cluster
-  API_SERVICE:    api-service
-  PROXY_SERVICE:  proxy-service
+  AWS_REGION:          ap-south-1
+  AWS_ACCOUNT_ID:      "030230817033"
+  CLUSTER:             sofiyan-cluster
+  API_SERVICE:         api-service
+  PROXY_SERVICE:       proxy-service
+  ECS_SUBNETS:         ${{ secrets.ECS_SUBNETS }}         # e.g. "subnet-123,subnet-456,subnet-789"
+  ECS_SECURITY_GROUPS: ${{ secrets.ECS_SECURITY_GROUPS }} # e.g. "sg-abc,sg-def"
 
 jobs:
   build-and-push:
@@ -35,7 +37,7 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  # omit if not using temporary creds
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  # omit if you don’t use session tokens
           aws-region:            ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
@@ -46,10 +48,8 @@ jobs:
 
       - name: Ensure ECR repo exists
         run: |
-          aws ecr describe-repositories \
-            --repository-names "${{ matrix.service }}" \
-          || aws ecr create-repository \
-            --repository-name "${{ matrix.service }}"
+          aws ecr describe-repositories --repository-names "${{ matrix.service }}" \
+            || aws ecr create-repository --repository-name "${{ matrix.service }}"
 
       - name: Build & push ${{ matrix.service }}
         uses: docker/build-push-action@v4
@@ -60,7 +60,7 @@ jobs:
           tags:    ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.service }}:latest
 
   update-ecs:
-    name: Roll ECS services to new images
+    name: Ensure & Update ECS services
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
@@ -72,16 +72,45 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
+      - name: Install jq for JSON parsing
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Ensure API service exists
+        run: |
+          if ! aws ecs describe-services --cluster $CLUSTER --services $API_SERVICE \
+               | jq -e '.services[0].status=="ACTIVE"' >/dev/null; then
+            aws ecs create-service \
+              --cluster $CLUSTER \
+              --service-name $API_SERVICE \
+              --task-definition ${API_SERVICE}:latest \
+              --launch-type FARGATE \
+              --desired-count 1 \
+              --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}"
+          fi
+
+      - name: Ensure Proxy service exists
+        run: |
+          if ! aws ecs describe-services --cluster $CLUSTER --services $PROXY_SERVICE \
+               | jq -e '.services[0].status=="ACTIVE"' >/dev/null; then
+            aws ecs create-service \
+              --cluster $CLUSTER \
+              --service-name $PROXY_SERVICE \
+              --task-definition ${PROXY_SERVICE}:latest \
+              --launch-type FARGATE \
+              --desired-count 1 \
+              --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}"
+          fi
+
       - name: Force new deployment for API service
         run: |
           aws ecs update-service \
-            --cluster ${{ env.CLUSTER }} \
-            --service ${{ env.API_SERVICE }} \
+            --cluster $CLUSTER \
+            --service $API_SERVICE \
             --force-new-deployment
 
       - name: Force new deployment for Proxy service
         run: |
           aws ecs update-service \
-            --cluster ${{ env.CLUSTER }} \
-            --service ${{ env.PROXY_SERVICE }} \
+            --cluster $CLUSTER \
+            --service $PROXY_SERVICE \
             --force-new-deployment
