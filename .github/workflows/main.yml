@@ -1,3 +1,4 @@
+# .github/workflows/ci-cd.yml
 name: Build & Deploy Docker Images → ECR → ECS
 
 on:
@@ -10,14 +11,17 @@ env:
   CLUSTER:             sofiyan-cluster
   API_SERVICE:         api-service
   PROXY_SERVICE:       proxy-service
-  ECS_SUBNETS:         ${{ secrets.ECS_SUBNETS }}         # e.g. "subnet-123,subnet-456,subnet-789"
-  ECS_SECURITY_GROUPS: ${{ secrets.ECS_SECURITY_GROUPS }} # e.g. "sg-abc,sg-def"
+  ECS_SUBNETS:         ${{ secrets.ECS_SUBNETS }}
+  ECS_SECURITY_GROUPS: ${{ secrets.ECS_SECURITY_GROUPS }}
+  ECS_EXECUTION_ROLE:  ${{ secrets.ECS_EXECUTION_ROLE }}
+  ECS_TASK_ROLE:       ${{ secrets.ECS_TASK_ROLE }}
+  API_PORT:            9000
+  PROXY_PORT:          8000
 
 jobs:
   build-and-push:
     name: Build & Push Images to ECR
     runs-on: ubuntu-latest
-
     strategy:
       matrix:
         include:
@@ -29,22 +33,21 @@ jobs:
             path: S3-reverse-proxy
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  # omit if you don’t use session tokens
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  # omit if not used
           aws-region:            ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
         run: |
           aws ecr get-login-password --region $AWS_REGION \
             | docker login --username AWS --password-stdin \
-                ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+              $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
 
       - name: Ensure ECR repo exists
         run: |
@@ -57,13 +60,16 @@ jobs:
           context: ${{ matrix.path }}
           file:    ${{ matrix.path }}/Dockerfile
           push:    true
-          tags:    ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.service }}:latest
+          tags: |
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/${{ matrix.service }}:latest
 
-  update-ecs:
-    name: Ensure & Update ECS services
+  deploy-services:
+    name: Register & Deploy ECS Services
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -72,45 +78,73 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Install jq for JSON parsing
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Ensure API service exists
+      # ─── API Service ──────────────────────────────────────────
+      - name: Register API task definition
+        id: td-api
+        run: |
+          rev=$(aws ecs register-task-definition \
+            --family $API_SERVICE \
+            --execution-role-arn $ECS_EXECUTION_ROLE \
+            --task-role-arn $ECS_TASK_ROLE \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu "512" --memory "1024" \
+            --container-definitions "[{\"name\":\"api-server\",\"image\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$API_SERVICE:latest\",\"portMappings\":[{\"containerPort\":$API_PORT}]}]" \
+            --query "taskDefinition.revision" --output text)
+          echo "apiRevision=$rev" >> $GITHUB_OUTPUT
+
+      - name: Create or update API service
         run: |
           if ! aws ecs describe-services --cluster $CLUSTER --services $API_SERVICE \
                | jq -e '.services[0].status=="ACTIVE"' >/dev/null; then
             aws ecs create-service \
               --cluster $CLUSTER \
               --service-name $API_SERVICE \
-              --task-definition ${API_SERVICE}:latest \
+              --task-definition "$API_SERVICE:${{ steps.td-api.outputs.apiRevision }}" \
               --launch-type FARGATE \
               --desired-count 1 \
               --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}"
+          else
+            aws ecs update-service \
+              --cluster $CLUSTER \
+              --service $API_SERVICE \
+              --task-definition "$API_SERVICE:${{ steps.td-api.outputs.apiRevision }}" \
+              --force-new-deployment
           fi
 
-      - name: Ensure Proxy service exists
+      # ─── Proxy Service ─────────────────────────────────────────
+      - name: Register Proxy task definition
+        id: td-proxy
+        run: |
+          rev=$(aws ecs register-task-definition \
+            --family $PROXY_SERVICE \
+            --execution-role-arn $ECS_EXECUTION_ROLE \
+            --task-role-arn $ECS_TASK_ROLE \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu "256" --memory "512" \
+            --container-definitions "[{\"name\":\"s3-reverse-proxy\",\"image\":\"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$PROXY_SERVICE:latest\",\"portMappings\":[{\"containerPort\":$PROXY_PORT}]}]" \
+            --query "taskDefinition.revision" --output text)
+          echo "proxyRevision=$rev" >> $GITHUB_OUTPUT
+
+      - name: Create or update Proxy service
         run: |
           if ! aws ecs describe-services --cluster $CLUSTER --services $PROXY_SERVICE \
                | jq -e '.services[0].status=="ACTIVE"' >/dev/null; then
             aws ecs create-service \
               --cluster $CLUSTER \
               --service-name $PROXY_SERVICE \
-              --task-definition ${PROXY_SERVICE}:latest \
+              --task-definition "$PROXY_SERVICE:${{ steps.td-proxy.outputs.proxyRevision }}" \
               --launch-type FARGATE \
               --desired-count 1 \
               --network-configuration "awsvpcConfiguration={subnets=[${ECS_SUBNETS}],securityGroups=[${ECS_SECURITY_GROUPS}],assignPublicIp=ENABLED}"
+          else
+            aws ecs update-service \
+              --cluster $CLUSTER \
+              --service $PROXY_SERVICE \
+              --task-definition "$PROXY_SERVICE:${{ steps.td-proxy.outputs.proxyRevision }}" \
+              --force-new-deployment
           fi
-
-      - name: Force new deployment for API service
-        run: |
-          aws ecs update-service \
-            --cluster $CLUSTER \
-            --service $API_SERVICE \
-            --force-new-deployment
-
-      - name: Force new deployment for Proxy service
-        run: |
-          aws ecs update-service \
-            --cluster $CLUSTER \
-            --service $PROXY_SERVICE \
-            --force-new-deployment
